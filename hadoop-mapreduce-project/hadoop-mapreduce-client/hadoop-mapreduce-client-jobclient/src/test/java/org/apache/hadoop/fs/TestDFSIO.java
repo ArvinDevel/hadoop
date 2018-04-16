@@ -21,7 +21,9 @@ package org.apache.hadoop.fs;
 import java.io.BufferedReader;
 import java.io.Closeable;
 import java.io.DataInputStream;
+import java.io.EOFException;
 import java.io.File;
+import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -29,17 +31,24 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.PrintStream;
 import java.text.DecimalFormat;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Date;
+import java.util.EnumSet;
 import java.util.StringTokenizer;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadLocalRandom;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
+import org.apache.hadoop.hdfs.DFSInputStream;
+import org.apache.hadoop.hdfs.DFSOutputStream;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
 import org.apache.hadoop.hdfs.protocol.BlockStoragePolicy;
 import org.apache.hadoop.hdfs.protocol.ErasureCodingPolicy;
 import org.apache.hadoop.hdfs.protocol.ErasureCodingPolicyInfo;
+import org.apache.hadoop.io.IntWritable;
 import org.apache.hadoop.io.LongWritable;
 import org.apache.hadoop.io.SequenceFile;
 import org.apache.hadoop.io.SequenceFile.CompressionType;
@@ -67,7 +76,7 @@ import org.slf4j.LoggerFactory;
  * Distributed i/o benchmark.
  * <p>
  * This test writes into or reads from a specified number of files.
- * Number of bytes to write or read is specified as a parameter to the test. 
+ * Number of bytes to write or read is specified as a parameter to the test.
  * Each file is accessed in a separate map task.
  * <p>
  * The reducer collects the following statistics:
@@ -78,11 +87,11 @@ import org.slf4j.LoggerFactory;
  * <li>io rate</li>
  * <li>io rate squared</li>
  * </ul>
- *    
+ *
  * Finally, the following information is appended to a local file
  * <ul>
  * <li>read or write test</li>
- * <li>date and time the test finished</li>   
+ * <li>date and time the test finished</li>
  * <li>number of files</li>
  * <li>total number of bytes processed</li>
  * <li>throughput in mb/sec (total number of bytes / sum of processing times)</li>
@@ -96,6 +105,8 @@ public class TestDFSIO implements Tool {
   private static final int DEFAULT_BUFFER_SIZE = 1000000;
   private static final String BASE_FILE_NAME = "test_io_";
   private static final String DEFAULT_RES_FILE_NAME = "TestDFSIO_results.log";
+  private static final String DEFAULT_WRITE_LAT_FILE_NAME = "TestDFSIO_writeLatencies.log";
+  private static final String DEFAULT_E2E_LAT_FILE_NAME = "TestDFSIO_e2eLatencies.log";
   private static final long MEGA = ByteMultiple.MB.value();
   private static final int DEFAULT_NR_BYTES = 128;
   private static final int DEFAULT_NR_FILES = 4;
@@ -103,19 +114,25 @@ public class TestDFSIO implements Tool {
                     "Usage: " + TestDFSIO.class.getSimpleName() +
                     " [genericOptions]" +
                     " -read [-random | -backward | -skip [-skipSize Size]] |" +
-                    " -write | -append | -truncate | -clean" +
+                    " -write | -writeRead | -append | -truncate | -clean" +
                     " [-compression codecClassName]" +
                     " [-nrFiles N]" +
                     " [-size Size[B|KB|MB|GB|TB]]" +
                     " [-resFile resultFileName] [-bufferSize Bytes]" +
                     " [-storagePolicy storagePolicyName]" +
-                    " [-erasureCodePolicy erasureCodePolicyName]";
+                    " [-erasureCodePolicy erasureCodePolicyName]" +
+                    " [-baseDir baseDir]" +
+                    " [-writeLatencyFile writeLatencyFile]";
 
   private Configuration config;
   private static final String STORAGE_POLICY_NAME_KEY =
       "test.io.block.storage.policy";
   private static final String ERASURE_CODE_POLICY_NAME_KEY =
       "test.io.erasure.code.policy";
+  private static final String WriteLatencyFile =
+          "test.io.write.latency.file";
+  private static final String e2eLatencyFile =
+          "test.io.write.e2elatency.file";
 
   static{
     Configuration.addDefaultResource("hdfs-default.xml");
@@ -127,6 +144,7 @@ public class TestDFSIO implements Tool {
   private enum TestType {
     TEST_TYPE_READ("read"),
     TEST_TYPE_WRITE("write"),
+    TEST_TYPE_WRITE_READ("writeread"),
     TEST_TYPE_CLEANUP("cleanup"),
     TEST_TYPE_APPEND("append"),
     TEST_TYPE_READ_RANDOM("random read"),
@@ -332,7 +350,7 @@ public class TestDFSIO implements Tool {
   private static String getFileName(int fIdx) {
     return BASE_FILE_NAME + Integer.toString(fIdx);
   }
-  
+
   /**
    * Write/Read mapper base class.
    * <p>
@@ -362,7 +380,7 @@ public class TestDFSIO implements Tool {
 
       // try to initialize codec
       try {
-        codec = (compression == null) ? null : 
+        codec = (compression == null) ? null :
           Class.forName(compression).asSubclass(CompressionCodec.class);
       } catch(Exception e) {
         throw new RuntimeException("Compression codec not found: ", e);
@@ -377,16 +395,16 @@ public class TestDFSIO implements Tool {
     }
 
     @Override // IOMapperBase
-    void collectStats(OutputCollector<Text, Text> output, 
+    void collectStats(OutputCollector<Text, Text> output,
                       String name,
-                      long execTime, 
+                      long execTime,
                       Long objSize) throws IOException {
       long totalSize = objSize.longValue();
       float ioRateMbSec = (float)totalSize * 1000 / (execTime * MEGA);
       LOG.info("Number of bytes processed = " + totalSize);
       LOG.info("Exec time = " + execTime);
       LOG.info("IO rate = " + ioRateMbSec);
-      
+
       output.collect(new Text(AccumulatingReducer.VALUE_TYPE_LONG + "tasks"),
           new Text(String.valueOf(1)));
       output.collect(new Text(AccumulatingReducer.VALUE_TYPE_LONG + "size"),
@@ -405,7 +423,15 @@ public class TestDFSIO implements Tool {
    */
   public static class WriteMapper extends IOStatMapper {
 
+    long []startTimes;
+    int []writeLatencies;
     public WriteMapper() {
+      // used for start map directly(for -seq)
+      if(getConf() == null){
+        setConf(new TestDFSIO().config);
+        JobConf job = new JobConf(getConf(), TestDFSIO.class);
+        configure(job);
+      }
       for (int i = 0; i < bufferSize; i++) {
         buffer[i] = (byte) ('0' + i % 50);
       }
@@ -416,33 +442,276 @@ public class TestDFSIO implements Tool {
       // create file
       Path filePath = new Path(getDataDir(getConf()), name);
       OutputStream out = fs.create(filePath, true, bufferSize);
+      assert out != null;
       if (blockStoragePolicy != null) {
         fs.setStoragePolicy(filePath, blockStoragePolicy);
       }
       if(compressionCodec != null)
         out = compressionCodec.createOutputStream(out);
-      LOG.info("out = " + out.getClass().getName());
+      LOG.info("path = " + filePath + " out = " + out.getClass().getName());
       return out;
     }
 
+    // can't use getConf() when the map not called from MapJob(which has a config passed in)
     @Override // IOMapperBase
-    public Long doIO(Reporter reporter, 
-                       String name, 
+    public Long doIO(Reporter reporter,
+                       String name,
                        long totalSize // in bytes
                      ) throws IOException {
       OutputStream out = (OutputStream)this.stream;
+
+      LOG.info("out is " + out + "total Size is " + totalSize + "bufferSize is " + bufferSize);
+      if(out == null)
+        out = (OutputStream)getIOStream(name);
+      // (int)totalSize/bufferSize will lose data!
+      startTimes = new long[(int)(totalSize/bufferSize) + 1];
+      writeLatencies = new int[(int)(totalSize/bufferSize) + 1];
       // write to the file
       long nrRemaining;
+      int i = 0;
       for (nrRemaining = totalSize; nrRemaining > 0; nrRemaining -= bufferSize) {
         int curSize = (bufferSize < nrRemaining) ? bufferSize : (int)nrRemaining;
+        // use nano
+        startTimes[i++] = System.nanoTime();//System.currentTimeMillis();
         out.write(buffer, 0, curSize);
-        reporter.setStatus("writing " + name + "@" + 
-                           (totalSize - nrRemaining) + "/" + totalSize 
+        int lat = (int)(System.nanoTime() - startTimes[i-1]);
+        writeLatencies[i - 1] = lat;
+        reporter.setStatus("writing " + name + "@" +
+                           (totalSize - nrRemaining) + "/" + totalSize
                            + " ::host = " + hostName);
+      }
+      try (PrintStream latOut =new PrintStream(new FileOutputStream(new File(getConf().get(WriteLatencyFile, DEFAULT_WRITE_LAT_FILE_NAME)), true)); ){
+        // write latencies
+        for(int j = 0; j < writeLatencies.length; j++){
+          LOG.debug("latency of "+ j + " is: "+ writeLatencies[j]);
+          latOut.println(writeLatencies[j]);
+        }
       }
       return Long.valueOf(totalSize);
     }
   }
+
+  // todo seperate write & read to calculate e2e
+  /**
+   * Write Read mapper class, disable compress to use FSData stream.
+   */
+  public static class WriteReadMapper extends IOStatMapper {
+
+    long []startTimes;
+    long []writeLatencies;
+    long []e2eLatencies;
+    protected byte[] readBuffer;
+      // used for waiting until read finish
+      CountDownLatch latch = new CountDownLatch(1);;
+    public WriteReadMapper() {
+      // used for start map directly(for -seq)
+      if(getConf() == null){
+        setConf(new TestDFSIO().config);
+        JobConf job = new JobConf(getConf(), TestDFSIO.class);
+        configure(job);
+      }
+      for (int i = 0; i < bufferSize; i++) {
+        buffer[i] = (byte) ('0' + i % 50);
+      }
+      LOG.info("Constructor, bufferSize is {}", bufferSize);
+    }
+
+    @Override // IOMapperBase
+    public Closeable getIOStream(String name) throws IOException {
+      // create file
+      Path filePath = new Path(getDataDir(getConf()), name);
+      FSDataOutputStream out = fs.create(filePath, true, bufferSize);
+
+      // SYNC_BLOCK only sync when one block finish.
+//      fs.create(filePath, FsPermission.getDefault(),
+//              EnumSet.of(CreateFlag.SYNC_BLOCK), bufferSize, (short)3 ,
+//              getConf().getLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY, 128*1024*1024), null);
+      assert out != null;
+      if (blockStoragePolicy != null) {
+        fs.setStoragePolicy(filePath, blockStoragePolicy);
+      }
+      LOG.info("path = " + filePath + " out = " + out.getClass().getName());
+      return out;
+    }
+
+    // todo use nanoseconds when show 95'th percent(because it's too small to show in second）
+    // can't use getConf() when the map not called from MapJob(which has a config passed in)
+    @Override // IOMapperBase
+    public Long doIO(Reporter reporter,
+                     String name,
+                     long totalSize // in bytes
+    ) throws IOException {
+      FSDataOutputStream out = (FSDataOutputStream)this.stream;
+
+      LOG.info("out is " + out + "total Size is " + totalSize + "bufferSize is " + bufferSize);
+      if(out == null)
+        out = (FSDataOutputStream)getIOStream(name);
+    // (int)totalSize/bufferSize will lose data!
+      startTimes = new long[(int)(totalSize/bufferSize) + 1];
+      writeLatencies = new long[(int)(totalSize/bufferSize) + 1];
+      e2eLatencies = new long[(int)(totalSize/bufferSize) + 1];
+      readBuffer = new byte[bufferSize];
+
+        // start read thread
+      Thread thread = new Thread(){
+        public void run() {
+          long start = 0L;
+            long rStart = System.currentTimeMillis();
+          try {
+              while (start < totalSize - bufferSize){
+                start = read(name, start, totalSize);
+            }
+          } catch (IOException ioe) {
+              LOG.error("read from {} fail in read thread", start, ioe);
+          } finally {
+              latch.countDown();
+              Arrays.sort(e2eLatencies);
+              long rTime = System.currentTimeMillis() - rStart;
+              DecimalFormat df = new DecimalFormat("#.###");
+              String resultLines[] = {
+                      "            Date & time: " + new Date(System.currentTimeMillis()),
+                      "              File name: " + name,
+                      "      Total MBytes read: " + df.format(toMB(start)),
+                      "      Throughput mb/sec: " + df.format(toMB(start) / msToSecs(rTime)),
+                  "  95'th percent latency(ms): " + df.format(e2eLatencies[e2eLatencies.length*95/100]/1000000),
+                  "  99'th percent latency(ms): " + df.format(e2eLatencies[e2eLatencies.length*99/100]/1000000),
+                  "95th percentile latency(ms): " + df.format(percentile(e2eLatencies, 95)),
+                  "99th percentile latency(ms): " + df.format(percentile(e2eLatencies, 99)),
+                      "" };
+              try (PrintStream latOut =new PrintStream(new FileOutputStream(new File(getConf().get(e2eLatencyFile, DEFAULT_E2E_LAT_FILE_NAME)), true))){
+                  // write latencies
+                  for(String line: resultLines) {
+                      latOut.println(line);
+                  }
+                  // write latencies
+                  for(long latency: e2eLatencies){
+                      latOut.println(Long.toString(latency) + "\t" + (latency / 1000000) + "ms");
+                  }
+              } catch (FileNotFoundException fne){
+                  LOG.error("FileNotFoundException", fne);
+              }
+
+              // show percentile
+              LOG.info("99th percentile e2elatency: {}", percentile(e2eLatencies, 99));
+              LOG.info("95th percentile e2elatency: {}", percentile(e2eLatencies, 95));
+          }
+        }
+      };
+      thread.start();
+      try {
+        thread.sleep(100);
+      } catch (InterruptedException ie){
+        thread.interrupt();
+      }
+
+      long wStart = System.currentTimeMillis();
+        // write to the file
+      long nrRemaining;
+      int i = 0;
+      for (nrRemaining = totalSize; nrRemaining > 0; nrRemaining -= bufferSize) {
+        int curSize = (bufferSize < nrRemaining) ? bufferSize : (int)nrRemaining;
+        // use nano
+        startTimes[i++] = System.nanoTime();
+        out.write(buffer, 0, curSize);
+        // sync every packet, used to cmp with bk
+        out.hsync();
+        int lat = (int)(System.nanoTime() - startTimes[i-1]);
+        writeLatencies[i - 1] = lat;
+        reporter.setStatus("writing " + name + "@" +
+                (totalSize - nrRemaining) + "/" + totalSize
+                + " ::host = " + hostName);
+      }
+
+      Arrays.sort(writeLatencies);
+      out.hsync();
+      long wTime = System.currentTimeMillis() - wStart;
+        DecimalFormat df = new DecimalFormat("#.###");
+        String resultLines[] = {
+                "            Date & time: " + new Date(System.currentTimeMillis()),
+                "              File name: " + name,
+                "     Total MBytes write: " + df.format(toMB(totalSize)),
+                "      Throughput mb/sec: " + df.format(toMB(totalSize) / msToSecs(wTime)),
+              "95'th percent latency(ms): " + df.format(writeLatencies[writeLatencies.length*95/100]/1000000),
+              "99'th percent latency(ms): " + df.format(writeLatencies[writeLatencies.length*99/100]/1000000),
+            "95th percentile latency(ms): " + df.format(percentile(writeLatencies, 95)),
+            "99th percentile latency(ms): " + df.format(percentile(writeLatencies, 99)),
+                "" };
+
+      try (PrintStream latOut =new PrintStream(new FileOutputStream(new File(getConf().get(WriteLatencyFile, DEFAULT_WRITE_LAT_FILE_NAME)), true)); ){
+          for(String line: resultLines) {
+              latOut.println(line);
+          }
+          // write latencies
+          for(long latency: writeLatencies){
+            latOut.println(Long.toString(latency) + "\t" + (latency / 1000000) + "ms");
+          }
+
+      }
+      // show percentile
+      LOG.info("99th percentile latency: {}", percentile(writeLatencies, 99));
+      LOG.info("95th percentile latency: {}", percentile(writeLatencies, 95));
+
+      try {
+          latch.await();
+      } catch (InterruptedException ie){
+          LOG.error("IE when waiting reading to be finished", ie);
+      }
+      return Long.valueOf(totalSize);
+    }
+
+    long read(String name, long start, long totalSize) throws IOException{
+      // open file
+        Path filePath = new Path(getDataDir(getConf()), name);
+        FSDataInputStream in = fs.open(filePath);
+//      if(compressionCodec != null)
+//        in = compressionCodec.createInputStream(in);
+//      LOG.info("path: " + filePath + " in: " + in + "buffer size: " + bufferSize);
+      long actualSize = 0;
+        try {
+            in.seek(start);
+        } catch (EOFException eof){
+            LOG.error("seek after EOF error", eof);
+            return actualSize + start;
+        }
+        while (actualSize < totalSize) {
+          int curSize = in.read(readBuffer, 0, bufferSize);
+        if(curSize < 0) break;
+        actualSize += curSize;
+        int index = (int)((start + actualSize)/bufferSize);
+        e2eLatencies[index] = System.nanoTime() - startTimes[index];
+//        LOG.info("reading " + name + "@" + actualSize + "/" + totalSize + " ::host = " + hostName);
+      }
+      //LOG.info("read {}Bytes from {}", actualSize, start);
+      if(in != null) in.close();
+      return actualSize + start;
+    }
+
+  }
+
+  private static double percentile(long[] latency, int percentile) {
+        int size = latency.length;
+        int sampleSize = (size * percentile) / 100;
+        long total = 0;
+        int count = 0;
+        for (int i = 0; i < sampleSize; i++) {
+            total += latency[i];
+            count++;
+        }
+        return ((double) total / (double) count) / 1000000.0;
+    }
+
+  private long writeReadTest(FileSystem fs) throws IOException {
+        Path writeDir = getWriteDir(config);
+        fs.delete(getDataDir(config), true);
+        fs.delete(writeDir, true);
+        long tStart = System.currentTimeMillis();
+        if (isECEnabled()) {
+            createAndEnableECOnPath(fs, getDataDir(config));
+        }
+        runIOTest(WriteReadMapper.class, writeDir);
+        long execTime = System.currentTimeMillis() - tStart;
+        return execTime;
+    }
 
   private long writeTest(FileSystem fs) throws IOException {
     Path writeDir = getWriteDir(config);
@@ -456,9 +725,9 @@ public class TestDFSIO implements Tool {
     long execTime = System.currentTimeMillis() - tStart;
     return execTime;
   }
-  
+
   private void runIOTest(
-          Class<? extends Mapper<Text, LongWritable, Text, Text>> mapperClass, 
+          Class<? extends Mapper<Text, LongWritable, Text, Text>> mapperClass,
           Path outputDir) throws IOException {
     JobConf job = new JobConf(config, TestDFSIO.class);
 
@@ -467,6 +736,8 @@ public class TestDFSIO implements Tool {
 
     job.setMapperClass(mapperClass);
     job.setReducerClass(AccumulatingReducer.class);
+
+
 
     FileOutputFormat.setOutputPath(job, outputDir);
     job.setOutputKeyClass(Text.class);
@@ -480,7 +751,7 @@ public class TestDFSIO implements Tool {
    */
   public static class AppendMapper extends IOStatMapper {
 
-    public AppendMapper() { 
+    public AppendMapper() {
       for(int i=0; i < bufferSize; i++)
         buffer[i] = (byte)('0' + i % 50);
     }
@@ -497,8 +768,8 @@ public class TestDFSIO implements Tool {
     }
 
     @Override // IOMapperBase
-    public Long doIO(Reporter reporter, 
-                       String name, 
+    public Long doIO(Reporter reporter,
+                       String name,
                        long totalSize // in bytes
                      ) throws IOException {
       OutputStream out = (OutputStream)this.stream;
@@ -507,8 +778,8 @@ public class TestDFSIO implements Tool {
       for (nrRemaining = totalSize; nrRemaining > 0; nrRemaining -= bufferSize) {
         int curSize = (bufferSize < nrRemaining) ? bufferSize : (int)nrRemaining;
         out.write(buffer, 0, curSize);
-        reporter.setStatus("writing " + name + "@" + 
-                           (totalSize - nrRemaining) + "/" + totalSize 
+        reporter.setStatus("writing " + name + "@" +
+                           (totalSize - nrRemaining) + "/" + totalSize
                            + " ::host = " + hostName);
       }
       return Long.valueOf(totalSize);
@@ -529,13 +800,21 @@ public class TestDFSIO implements Tool {
    */
   public static class ReadMapper extends IOStatMapper {
 
-    public ReadMapper() { 
+    public ReadMapper() {
     }
 
     @Override // IOMapperBase
     public Closeable getIOStream(String name) throws IOException {
       // open file
-      InputStream in = fs.open(new Path(getDataDir(getConf()), name));
+        InputStream in = null;
+        while (in == null){
+            try {
+                in = fs.open(new Path(getDataDir(getConf()), name));
+            } catch (IOException ioe){
+                LOG.error("open ioe error ", ioe);
+                in = null;
+            }
+        }
       if(compressionCodec != null)
         in = compressionCodec.createInputStream(in);
       LOG.info("in = " + in.getClass().getName());
@@ -543,8 +822,8 @@ public class TestDFSIO implements Tool {
     }
 
     @Override // IOMapperBase
-    public Long doIO(Reporter reporter, 
-                       String name, 
+    public Long doIO(Reporter reporter,
+                       String name,
                        long totalSize // in bytes
                      ) throws IOException {
       InputStream in = (InputStream)this.stream;
@@ -553,8 +832,8 @@ public class TestDFSIO implements Tool {
         int curSize = in.read(buffer, 0, bufferSize);
         if(curSize < 0) break;
         actualSize += curSize;
-        reporter.setStatus("reading " + name + "@" + 
-                           actualSize + "/" + totalSize 
+        reporter.setStatus("reading " + name + "@" +
+                           actualSize + "/" + totalSize
                            + " ::host = " + hostName);
       }
       return Long.valueOf(actualSize);
@@ -575,7 +854,7 @@ public class TestDFSIO implements Tool {
    * The mapper chooses a position in the file and reads bufferSize
    * bytes starting at the chosen position.
    * It stops after reading the totalSize bytes, specified by -size.
-   * 
+   *
    * There are three type of reads.
    * 1) Random read always chooses a random position to read from: skipSize = 0
    * 2) Backward read reads file in reverse order                : skipSize < 0
@@ -592,7 +871,7 @@ public class TestDFSIO implements Tool {
       skipSize = conf.getLong("test.io.skip.size", 0);
     }
 
-    public RandomReadMapper() { 
+    public RandomReadMapper() {
       rnd = ThreadLocalRandom.current();
     }
 
@@ -609,8 +888,8 @@ public class TestDFSIO implements Tool {
     }
 
     @Override // IOMapperBase
-    public Long doIO(Reporter reporter, 
-                       String name, 
+    public Long doIO(Reporter reporter,
+                       String name,
                        long totalSize // in bytes
                      ) throws IOException {
       PositionedReadable in = (PositionedReadable)this.stream;
@@ -620,8 +899,8 @@ public class TestDFSIO implements Tool {
         int curSize = in.read(pos, buffer, 0, bufferSize);
         if(curSize < 0) break;
         actualSize += curSize;
-        reporter.setStatus("reading " + name + "@" + 
-                           actualSize + "/" + totalSize 
+        reporter.setStatus("reading " + name + "@" +
+                           actualSize + "/" + totalSize
                            + " ::host = " + hostName);
       }
       return Long.valueOf(actualSize);
@@ -630,7 +909,7 @@ public class TestDFSIO implements Tool {
     /**
      * Get next offset for reading.
      * If current < 0 then choose initial offset according to the read type.
-     * 
+     *
      * @param current offset
      * @return
      */
@@ -672,12 +951,12 @@ public class TestDFSIO implements Tool {
     }
 
     @Override // IOMapperBase
-    public Long doIO(Reporter reporter, 
-                       String name, 
+    public Long doIO(Reporter reporter,
+                       String name,
                        long newLength // in bytes
                      ) throws IOException {
       boolean isClosed = fs.truncate(filePath, newLength);
-      reporter.setStatus("truncating " + name + " to newLength " + 
+      reporter.setStatus("truncating " + name + " to newLength " +
           newLength  + " ::host = " + hostName);
       for(int i = 0; !isClosed; i++) {
         try {
@@ -686,7 +965,7 @@ public class TestDFSIO implements Tool {
         FileStatus status = fs.getFileStatus(filePath);
         assert status != null : "status is null";
         isClosed = (status.getLen() == newLength);
-        reporter.setStatus("truncate recover for " + name + " to newLength " + 
+        reporter.setStatus("truncate recover for " + name + " to newLength " +
             newLength + " attempt " + i + " ::host = " + hostName);
       }
       return Long.valueOf(fileSize - newLength);
@@ -702,8 +981,8 @@ public class TestDFSIO implements Tool {
     return execTime;
   }
 
-  private void sequentialTest(FileSystem fs, 
-                              TestType testType, 
+  private void sequentialTest(FileSystem fs,
+                              TestType testType,
                               long fileSize, // in bytes
                               int nrFiles
                              ) throws IOException {
@@ -731,7 +1010,7 @@ public class TestDFSIO implements Tool {
     }
     for(int i=0; i < nrFiles; i++)
       ioer.doIO(Reporter.NULL,
-                BASE_FILE_NAME+Integer.toString(i), 
+                BASE_FILE_NAME+Integer.toString(i),
                 fileSize);
   }
 
@@ -756,6 +1035,7 @@ public class TestDFSIO implements Tool {
     int bufferSize = DEFAULT_BUFFER_SIZE;
     long nrBytes = 1*MEGA;
     String erasureCodePolicyName = null;
+    String writeLatencyFileName = null;
     int nrFiles = 1;
     long skipSize = 0;
     String resFileName = DEFAULT_RES_FILE_NAME;
@@ -775,6 +1055,8 @@ public class TestDFSIO implements Tool {
         testType = TestType.TEST_TYPE_READ;
       } else if (args[i].equalsIgnoreCase("-write")) {
         testType = TestType.TEST_TYPE_WRITE;
+      } else if (args[i].equalsIgnoreCase("-writeread")) {
+          testType = TestType.TEST_TYPE_WRITE_READ;
       } else if (args[i].equalsIgnoreCase("-append")) {
         testType = TestType.TEST_TYPE_APPEND;
       } else if (args[i].equalsIgnoreCase("-random")) {
@@ -799,16 +1081,22 @@ public class TestDFSIO implements Tool {
       } else if (args[i].equalsIgnoreCase("-filesize")
           || args[i].equalsIgnoreCase("-size")) {
         nrBytes = parseSize(args[++i]);
+      } else if (args[i].equalsIgnoreCase("-packetsize")) {
+        config.set("dfs.client-write-packet-size", args[++i]);
       } else if (args[i].equalsIgnoreCase("-skipsize")) {
         skipSize = parseSize(args[++i]);
       } else if (args[i].equalsIgnoreCase("-buffersize")) {
         bufferSize = Integer.parseInt(args[++i]);
       } else if (args[i].equalsIgnoreCase("-resfile")) {
         resFileName = args[++i];
+      } else if (args[i].equalsIgnoreCase("-baseDir")) {
+        config.set("test.build.data", args[++i]);
       } else if (args[i].equalsIgnoreCase("-storagePolicy")) {
         storagePolicy = args[++i];
       } else if (args[i].equalsIgnoreCase("-erasureCodePolicy")) {
         erasureCodePolicyName = args[++i];
+      } else if (args[i].equalsIgnoreCase("-writeLatencyFile")) {
+        writeLatencyFileName = args[++i];
       } else {
         System.err.println("Illegal argument: " + args[i]);
         return -1;
@@ -830,7 +1118,7 @@ public class TestDFSIO implements Tool {
       LOG.info("skipSize = " + skipSize);
     }
     LOG.info("baseDir = " + getBaseDir(config));
-    
+
     if (compressionClass != null) {
       config.set("test.io.compression.class", compressionClass);
       LOG.info("compressionClass = " + compressionClass);
@@ -845,6 +1133,12 @@ public class TestDFSIO implements Tool {
         return -1;
       }
     }
+
+    if (writeLatencyFileName != null) {
+      config.set(WriteLatencyFile, writeLatencyFileName);
+      config.set(e2eLatencyFile, writeLatencyFileName + "e2e");
+    }
+
 
     if (storagePolicy != null) {
       if (!checkStoragePolicy(storagePolicy, fs)) {
@@ -870,6 +1164,9 @@ public class TestDFSIO implements Tool {
     case TEST_TYPE_WRITE:
       writeTest(fs);
       break;
+    case TEST_TYPE_WRITE_READ:
+      writeReadTest(fs);
+      break;
     case TEST_TYPE_READ:
       readTest(fs);
       break;
@@ -887,7 +1184,7 @@ public class TestDFSIO implements Tool {
    default:
     }
     long execTime = System.currentTimeMillis() - tStart;
-  
+
     analyzeResult(fs, testType, execTime, resFileName);
     return 0;
   }
@@ -904,7 +1201,7 @@ public class TestDFSIO implements Tool {
 
   /**
    * Returns size in bytes.
-   * 
+   *
    * @param arg = {d}[B|KB|MB|GB|TB]
    * @return
    */
@@ -1032,7 +1329,7 @@ public class TestDFSIO implements Tool {
       String line;
       while((line = lines.readLine()) != null) {
         StringTokenizer tokens = new StringTokenizer(line, " \t\n\r\f%");
-        String attr = tokens.nextToken(); 
+        String attr = tokens.nextToken();
         if (attr.endsWith(":tasks"))
           tasks = Long.parseLong(tokens.nextToken());
         else if (attr.endsWith(":size"))
@@ -1065,7 +1362,7 @@ public class TestDFSIO implements Tool {
 
     PrintStream res = null;
     try {
-      res = new PrintStream(new FileOutputStream(new File(resFileName), true)); 
+      res = new PrintStream(new FileOutputStream(new File(resFileName), true));
       for(int i = 0; i < resultLines.length; i++) {
         LOG.info(resultLines[i]);
         res.println(resultLines[i]);
@@ -1078,6 +1375,8 @@ public class TestDFSIO implements Tool {
   private Path getReduceFilePath(TestType testType) {
     switch(testType) {
     case TEST_TYPE_WRITE:
+      return new Path(getWriteDir(config), "part-00000");
+    case TEST_TYPE_WRITE_READ:
       return new Path(getWriteDir(config), "part-00000");
     case TEST_TYPE_APPEND:
       return new Path(getAppendDir(config), "part-00000");
